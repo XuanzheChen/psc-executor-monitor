@@ -23,6 +23,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Monitor selftest failed" }
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\test-registry-monitor.ps1
           if ($LASTEXITCODE -ne 0) { throw "Registry reader tests failed" }
+      - name: Test bootstrap from a fresh checkout
+        shell: powershell
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\test-first-run.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Fresh checkout bootstrap failed" }
       - name: Test compiled launcher
         shell: powershell
         run: |

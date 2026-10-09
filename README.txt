@@ -1,31 +1,28 @@
-PSC Executor 实时监视器（Windows）
-===================================
+﻿PSC Executor 实时监视器 — Windows 使用说明
+=============================================
 
-启动：双击桌面快捷方式（运行 PSC-Monitor-Neon.exe），或双击 start-monitor.vbs。
-当前图标为截图指定的深蓝底 + 青绿色霓虹监护仪（中间有心电波形和爱心）。
-图标资源：psc-monitor-neon.ico（包含 16/20/24/32/40/48/64/128/256 多种尺寸）。
-本轮替换之前的程序和图标备份于 backup-before-neon-20261009-112058。
-首次启动显示独立悬浮窗口，默认置顶。
-点击最小化（—）：保留在底部任务栏，可从任务栏恢复。
-点击关闭（X）：隐藏到系统托盘（右下角通知区域），继续监视。
-左键单击托盘图标：立即恢复窗口（双击同样有效）。图标可能藏在 ^ 隐藏图标菜单中。
-右击托盘图标：显示窗口 / 立即刷新 / 始终置顶 / 退出监视器。
-要真正结束监视器，请使用托盘菜单「退出监视器」。
+全新 GitHub clone / pull 后：
+  1. 双击仓库目录中的 start-monitor.vbs。
+  2. 首次运行会自动编译 PSC-Monitor-Neon.exe，并创建 monitor-config.json。
+  3. 在窗口顶部点“添加项目”，选择包含 .agentic-sdlc 的项目根目录。
+  4. 以后运行直接双击 start-monitor.vbs；必要时自动重新编译。
 
-每 30 秒读取一次 PSC 状态文件；界面计时器每 1 秒更新运行时长和事件间隔，不增加磁盘读取频率。
-执行中的运行时长会持续增长；PSC 报告完成后按其最终 elapsed_seconds 校准并冻结。
-距上次心跳、距最近实际事件均显示 HH:mm:ss（超过 24 小时的小时数继续增长）。
-实际执行完成到 GUI 下一次读取之间，最长约 30 秒可能暂时仍在计时，随后会校准。
-90 秒没有心跳将标记「疑似中断」。
-可在 GUI 的「添加项目」选择更多仓库，或修改 monitor-config.json
-中的 repositories 列表（文件保存到本目录）。
+说明：
+- EXE 是构建产物，不上传 GitHub；这是正常现象。
+- monitor-config.json 保存用户的本地项目路径，也不上传 GitHub。
+- 编译仅依赖 Windows PowerShell 5.1 和 .NET Framework 4.x 的 csc.exe。
+- 如果启动失败，检查 monitor-setup-error.log 或手动执行：
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ensure-monitor.ps1
 
-只读取：
-  <仓库>\.agentic-sdlc\developing\<工作流>\runtime\executor-progress.json
-  <仓库>\.agentic-sdlc\developing\<工作流>\runtime\executor-progress\<run_id>.jsonl
-不调用 Executor，不更改 PSC 工作流、预算或代码仓库。
+使用：
+- 每 30 秒从 PSC 文件读取一次状态；运行时间、心跳间隔和最近事件间隔每秒刷新。
+- 最小化（—）保留在任务栏；关闭（×）隐藏到系统托盘。
+- 左键点击托盘图标恢复；右键菜单可以退出程序。
+- 点击“添加项目”支持管理多个 PSC 项目。
+- 数据只读；不修改 Executor、Supervisor、PSC 工作流或重试预算。
 
-诊断命令：
- powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File "D:\Tools\PSC-Monitor\PSC-Monitor.ps1" -SelfTest
+开发与测试：
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\test-first-run.ps1
 
-提示：脚本使用 UTF-8 with BOM，兼容 Windows PowerShell 5.1。
+远程源码：https://github.com/XuanzheChen/psc-executor-monitor
