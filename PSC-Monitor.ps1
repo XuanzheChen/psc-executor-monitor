@@ -398,7 +398,58 @@ $script:ProjectCombo.DropDownStyle="DropDownList"
 $script:ProjectCombo.Location=New-Object System.Drawing.Point(20,64)
 $script:ProjectCombo.Size=New-Object System.Drawing.Size(370,28)
 $script:ProjectCombo.Anchor="Top,Left,Right"
+$script:ProjectCombo.DrawMode=[System.Windows.Forms.DrawMode]::OwnerDrawFixed
 $script:Form.Controls.Add($script:ProjectCombo)
+
+# WinForms DropDownList 不允许改写 Text；仅对关闭状态的选中项进行滚动绘制。
+$script:ProjectScrollHover=$false
+$script:ProjectScrollOffset=0
+$script:ProjectScrollMaxOffset=0
+$script:ProjectScrollDirection=1
+$script:ProjectScrollPauseTicks=10
+function Reset-ProjectPathScroll {
+    $script:ProjectScrollOffset=0
+    $script:ProjectScrollDirection=1
+    $script:ProjectScrollPauseTicks=10
+    $script:ProjectCombo.Invalidate()
+}
+function Step-ProjectPathMarquee([int]$Offset,[int]$MaxOffset,[int]$Direction,[int]$PauseTicks) {
+    $MaxOffset=[math]::Max(0,$MaxOffset)
+    $Offset=[math]::Min($MaxOffset,[math]::Max(0,$Offset))
+    if($MaxOffset -eq 0){return [pscustomobject]@{Offset=0;Direction=1;PauseTicks=0}}
+    if($PauseTicks -gt 0){return [pscustomobject]@{Offset=$Offset;Direction=$Direction;PauseTicks=($PauseTicks-1)}}
+    $step=if($Direction -lt 0){-3}else{3}
+    $next=[math]::Min($MaxOffset,[math]::Max(0,$Offset+$step))
+    if($next -eq $MaxOffset){return [pscustomobject]@{Offset=$next;Direction=-1;PauseTicks=12}}
+    if($next -eq 0){return [pscustomobject]@{Offset=0;Direction=1;PauseTicks=12}}
+    return [pscustomobject]@{Offset=$next;Direction=$Direction;PauseTicks=0}
+}
+$script:ProjectCombo.Add_DrawItem({
+    param($sender,$e)
+    if($e.Index -lt 0){return}
+    $value=[string]$script:ProjectCombo.Items[$e.Index]
+    $isEdit=($e.State -band [System.Windows.Forms.DrawItemState]::ComboBoxEdit) -ne 0
+    $e.DrawBackground()
+    $offset=0
+    if($isEdit){
+        $width=[math]::Ceiling($e.Graphics.MeasureString($value,$script:ProjectCombo.Font,[int]::MaxValue,[System.Drawing.StringFormat]::GenericTypographic).Width)
+        $script:ProjectScrollMaxOffset=[math]::Max(0,$width-[math]::Max(1,$e.Bounds.Width-7))
+        $script:ProjectScrollOffset=[math]::Min($script:ProjectScrollOffset,$script:ProjectScrollMaxOffset)
+        if($script:ProjectScrollHover -and -not $script:ProjectCombo.DroppedDown){$offset=$script:ProjectScrollOffset}
+    }
+    $foreground=if(($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0){[System.Drawing.SystemColors]::HighlightText}else{[System.Drawing.SystemColors]::WindowText}
+    $brush=New-Object System.Drawing.SolidBrush($foreground)
+    $saved=$e.Graphics.Save()
+    try {
+        $e.Graphics.SetClip($e.Bounds)
+        $y=$e.Bounds.Top+[math]::Max(0,($e.Bounds.Height-$script:ProjectCombo.Font.Height)/2)
+        $e.Graphics.DrawString($value,$script:ProjectCombo.Font,$brush,[single]($e.Bounds.Left+3-$offset),[single]$y,[System.Drawing.StringFormat]::GenericTypographic)
+    } finally {
+        $e.Graphics.Restore($saved)
+        $brush.Dispose()
+    }
+    $e.DrawFocusRectangle()
+})
 $script:AddButton = Make-Button "添加项目" 404 62 100
 $script:RemoveButton = Make-Button "移除项目" 510 62 110
 $script:AddButton.Anchor="Top,Right"
@@ -520,6 +571,7 @@ function Exit-Monitor {
     $script:ExitRequested=$true
     $script:Timer.Stop()
     $script:ClockTimer.Stop()
+    $script:ProjectScrollTimer.Stop()
     $script:Tray.Visible=$false
     $script:Tray.Dispose()
     $script:Form.Close()
@@ -534,7 +586,48 @@ $script:ClockTimer.Interval=1000
 $script:ClockTimer.Add_Tick({
     try { Update-LiveClocks } catch { $script:LastUiError=$_.Exception.Message }
 })
-$script:ProjectCombo.Add_SelectedIndexChanged({ $script:RemoveButton.Enabled=($script:ProjectCombo.SelectedIndex -gt 0); Safe-Refresh })
+# 悬停时仅做 WinForms 重绘，不读取 PSC 数据；离开、展开和切换项目均复位。
+$script:ProjectScrollTimer=New-Object System.Windows.Forms.Timer
+$script:ProjectScrollTimer.Interval=40
+$script:ProjectScrollTimer.Add_Tick({
+    if(-not $script:ProjectScrollHover -or $script:ProjectCombo.DroppedDown){
+        $script:ProjectScrollTimer.Stop()
+        return
+    }
+    if($script:ProjectScrollMaxOffset -le 0){return}
+    $frame=Step-ProjectPathMarquee $script:ProjectScrollOffset $script:ProjectScrollMaxOffset $script:ProjectScrollDirection $script:ProjectScrollPauseTicks
+    $script:ProjectScrollOffset=$frame.Offset
+    $script:ProjectScrollDirection=$frame.Direction
+    $script:ProjectScrollPauseTicks=$frame.PauseTicks
+    $script:ProjectCombo.Invalidate()
+})
+$script:ProjectCombo.Add_MouseEnter({
+    $script:ProjectScrollHover=$true
+    Reset-ProjectPathScroll
+    if(-not $script:ProjectCombo.DroppedDown){$script:ProjectScrollTimer.Start()}
+})
+$script:ProjectCombo.Add_MouseLeave({
+    $script:ProjectScrollHover=$false
+    $script:ProjectScrollTimer.Stop()
+    Reset-ProjectPathScroll
+})
+$script:ProjectCombo.Add_DropDown({
+    $script:ProjectScrollTimer.Stop()
+    Reset-ProjectPathScroll
+})
+$script:ProjectCombo.Add_DropDownClosed({
+    if($script:ProjectCombo.ClientRectangle.Contains($script:ProjectCombo.PointToClient([System.Windows.Forms.Cursor]::Position))){
+        $script:ProjectScrollHover=$true
+        Reset-ProjectPathScroll
+        $script:ProjectScrollTimer.Start()
+    }
+})
+$script:ProjectCombo.Add_SizeChanged({Reset-ProjectPathScroll})
+$script:ProjectCombo.Add_SelectedIndexChanged({
+    Reset-ProjectPathScroll
+    $script:RemoveButton.Enabled=($script:ProjectCombo.SelectedIndex -gt 0)
+    Safe-Refresh
+})
 $script:AddButton.Add_Click({
     $dialog=New-Object System.Windows.Forms.FolderBrowserDialog
     $dialog.Description="请选择包含 .agentic-sdlc 的项目根目录"
@@ -592,6 +685,7 @@ try {
 } finally {
     $script:Timer.Dispose()
     $script:ClockTimer.Dispose()
+    $script:ProjectScrollTimer.Dispose()
     $script:Tray.Visible=$false
     $script:Tray.Dispose()
     $script:Form.Dispose()
