@@ -1,0 +1,9 @@
+# Local configuration, logs, generated binaries and user data
+monitor-config.json
+monitor-error.log
+*.exe
+*.pdb
+*.tmp
+patch_gui.py
+*.bak
+*.log

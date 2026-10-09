@@ -1,0 +1,6 @@
+{
+  "refresh_seconds": 30,
+  "stale_seconds": 90,
+  "always_on_top": true,
+  "repositories": []
+}
