@@ -429,7 +429,12 @@ $script:ProjectCombo.Add_DrawItem({
     if($e.Index -lt 0){return}
     $value=[string]$script:ProjectCombo.Items[$e.Index]
     $isEdit=($e.State -band [System.Windows.Forms.DrawItemState]::ComboBoxEdit) -ne 0
-    $e.DrawBackground()
+    # WinForms 将收起状态的选中项也标记为 Selected；强制使用普通输入框配色。
+    if($isEdit){
+        $e.Graphics.FillRectangle([System.Drawing.SystemBrushes]::Window,$e.Bounds)
+    } else {
+        $e.DrawBackground()
+    }
     $offset=0
     if($isEdit){
         $width=[math]::Ceiling($e.Graphics.MeasureString($value,$script:ProjectCombo.Font,[int]::MaxValue,[System.Drawing.StringFormat]::GenericTypographic).Width)
@@ -437,7 +442,7 @@ $script:ProjectCombo.Add_DrawItem({
         $script:ProjectScrollOffset=[math]::Min($script:ProjectScrollOffset,$script:ProjectScrollMaxOffset)
         if($script:ProjectScrollHover -and -not $script:ProjectCombo.DroppedDown){$offset=$script:ProjectScrollOffset}
     }
-    $foreground=if(($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0){[System.Drawing.SystemColors]::HighlightText}else{[System.Drawing.SystemColors]::WindowText}
+    $foreground=if((-not $isEdit) -and (($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0)){[System.Drawing.SystemColors]::HighlightText}else{[System.Drawing.SystemColors]::WindowText}
     $brush=New-Object System.Drawing.SolidBrush($foreground)
     $saved=$e.Graphics.Save()
     try {
@@ -448,7 +453,7 @@ $script:ProjectCombo.Add_DrawItem({
         $e.Graphics.Restore($saved)
         $brush.Dispose()
     }
-    $e.DrawFocusRectangle()
+    if(-not $isEdit){$e.DrawFocusRectangle()}
 })
 $script:AddButton = Make-Button "添加项目" 404 62 100
 $script:RemoveButton = Make-Button "移除项目" 510 62 110
