@@ -205,7 +205,66 @@ function Format-Duration([double]$seconds) {
     if ($seconds -lt 0) { $seconds = 0 }
     $span = [TimeSpan]::FromSeconds($seconds)
     if ($span.Days -gt 0) { return "{0}天 {1:D2}:{2:D2}:{3:D2}" -f $span.Days,$span.Hours,$span.Minutes,$span.Seconds }
-    return "{0:D2}:{1:D2}:{2:D2}" -f [int]$span.TotalHours,$span.Minutes,$span.Seconds
+    # PowerShell 的 [int] 转换会四舍五入，例如 0.57 小时会变成 1 小时。
+    # 因此必须向下取整，否则运行超过 30 分钟时会凭空多显示 1 小时。
+    return "{0:D2}:{1:D2}:{2:D2}" -f ([long][math]::Floor($span.TotalHours)),$span.Minutes,$span.Seconds
+}
+
+# 仅计算窗口展示数据，不访问磁盘。执行中的计时依据 started_at 实时推算，
+# 结束后以 PSC 记录的 monotonic elapsed_seconds 作为最终运行时长。
+function Get-DisplayElapsed([object]$state) {
+    $recorded = [math]::Max(0, [double]$state.elapsed_seconds)
+    if ($state.status -ne "running") { return $recorded }
+    try {
+        $start = [DateTimeOffset]::Parse([string]$state.started_at)
+        $wall = ([DateTimeOffset]::UtcNow - $start.ToUniversalTime()).TotalSeconds
+        if ($wall -ge 0) { return [math]::Max($recorded, $wall) }
+    } catch {}
+    return $recorded
+}
+
+function Format-ClockAge([object]$timestamp) {
+    $age = Get-AgeSeconds $timestamp
+    if ([double]::IsInfinity($age) -or [double]::IsNaN($age)) { return "尚无记录" }
+    # HH 可超过 24：例如 28:03:15，不折算为日期。
+    $seconds = [long][math]::Floor([math]::Max(0, $age))
+    return "{0:D2}:{1:D2}:{2:D2}" -f ([long][math]::Floor($seconds / 3600)),([long][math]::Floor(($seconds % 3600) / 60)),([long]($seconds % 60))
+}
+
+# 以下函数每秒调用一次，只使用上次磁盘刷新缓存的状态快照。
+function Update-LiveClocks {
+    if (-not $script:DisplayedRun) { return }
+    $r = $script:DisplayedRun
+    $s = $r.State
+    $duration = Get-DisplayElapsed $s
+    $script:StatsLabel.Text = "步骤：" + $s.steps + "     工具调用：" + $s.tool_calls + "     已运行：" + (Format-Duration $duration)
+
+    if ($s.status -ne "running") {
+        $script:HealthLabel.Text = "本次已结束；等待下一次 Executor 调用。"
+        return
+    }
+
+    $heartbeat = $s.last_heartbeat_at
+    $effective = $heartbeat
+    if (-not $effective) { $effective = $s.last_executor_event_at }
+    if (-not $effective) { $effective = $s.started_at }
+    $isStale = (Get-AgeSeconds $effective) -gt [int]$script:Config.stale_seconds
+    if ($isStale) {
+        $script:StatusLabel.Text = "状态：疑似中断：心跳超时"
+        $script:StatusLabel.ForeColor = [System.Drawing.Color]::Firebrick
+    } else {
+        $script:StatusLabel.Text = "状态：执行中"
+        $script:StatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(30,130,80)
+    }
+
+    $script:HealthLabel.Text = "距上次心跳：" + (Format-ClockAge $heartbeat) +
+        "    |    距最近实际事件：" + (Format-ClockAge $s.last_executor_event_at)
+    if ($script:DisplayedActiveCount -gt 1) {
+        $script:HealthLabel.Text += "    |    同时执行：" + $script:DisplayedActiveCount
+    }
+    if ($script:DisplayedStaleCount -gt 0 -and -not $isStale) {
+        $script:HealthLabel.Text += "    |    其他异常：" + $script:DisplayedStaleCount
+    }
 }
 
 if ($SelfTest) {
@@ -227,6 +286,53 @@ if ($SelfTest) {
         $ok=($case[0] -eq $case[1])
         Write-Output ("状态测试 {0}: {1}" -f $case[0], $(if($ok){"通过"}else{"失败：" + $case[1]}))
         if(-not $ok){$fails++}
+    }
+    # 不访问任何真实项目文件，验证每秒计时及结束冻结行为。
+    $clockState = [PSCustomObject]@{
+        status="running"; elapsed_seconds=17.0
+        started_at=([DateTimeOffset]::UtcNow.AddSeconds(-18).ToString("o"))
+        last_heartbeat_at=([DateTimeOffset]::UtcNow.AddSeconds(-5).ToString("o"))
+        last_executor_event_at=([DateTimeOffset]::UtcNow.AddSeconds(-9).ToString("o"))
+        steps=4; tool_calls=6
+    }
+    $first = Get-DisplayElapsed $clockState
+    Start-Sleep -Milliseconds 1150
+    $second = Get-DisplayElapsed $clockState
+    $clockChecks = [ordered]@{}
+    # 边界回归：防止 [int] TotalHours 在 30~59 分钟时错误进位。
+    $clockChecks["未满30分钟"] = ((Format-Duration 1799) -eq "00:29:59")
+    $clockChecks["30分钟边界"] = ((Format-Duration 1800) -eq "00:30:00")
+    $clockChecks["截图34分钟样例"] = ((Format-Duration 2053) -eq "00:34:13")
+    $clockChecks["59分59秒"] = ((Format-Duration 3599) -eq "00:59:59")
+    $clockChecks["整1小时"] = ((Format-Duration 3600) -eq "01:00:00")
+    $clockChecks["1小时30分钟"] = ((Format-Duration 5401) -eq "01:30:01")
+    $clockChecks["跨天显示"] = ((Format-Duration 90000) -eq "1天 01:00:00")
+    $clockChecks["执行中耗时自然增长"] = (($second - $first) -ge 0.9)
+    $clockChecks["心跳HH:mm:ss"] = ((Format-ClockAge $clockState.last_heartbeat_at) -match "^\d{2}:\d{2}:\d{2}$")
+    $clockChecks["实际事件HH:mm:ss"] = ((Format-ClockAge $clockState.last_executor_event_at) -match "^\d{2}:\d{2}:\d{2}$")
+    $clockChecks["长时计数不回绕"] = ((Format-ClockAge ([DateTimeOffset]::UtcNow.AddHours(-26).ToString("o"))) -match "^26:\d{2}:\d{2}$")
+    $script:Config = [PSCustomObject]@{ stale_seconds=90 }
+    $script:DisplayedRun = [PSCustomObject]@{ State=$clockState }
+    $script:DisplayedActiveCount=1
+    $script:DisplayedStaleCount=0
+    $script:StatsLabel=New-Object System.Windows.Forms.Label
+    $script:StatusLabel=New-Object System.Windows.Forms.Label
+    $script:HealthLabel=New-Object System.Windows.Forms.Label
+    Update-LiveClocks
+    $clockChecks["窗口实时显示"] = ($script:StatsLabel.Text -match "已运行：\d{2}:\d{2}:\d{2}" -and
+        $script:HealthLabel.Text -match "距上次心跳：\d{2}:\d{2}:\d{2}" -and
+        $script:HealthLabel.Text -match "距最近实际事件：\d{2}:\d{2}:\d{2}")
+    $clockState.status="completed"
+    $clockState.elapsed_seconds=17.3
+    $stopped1=Get-DisplayElapsed $clockState
+    Start-Sleep -Milliseconds 1100
+    $stopped2=Get-DisplayElapsed $clockState
+    Update-LiveClocks
+    $clockChecks["结束时停止增长"] = ($stopped1 -eq $stopped2 -and $stopped2 -eq 17.3)
+    $clockChecks["结束时显示最终耗时"] = ($script:StatsLabel.Text -match "已运行：00:00:17")
+    foreach ($name in $clockChecks.Keys) {
+        if($clockChecks[$name]) { Write-Output ("计时测试 {0}：通过" -f $name) }
+        else { Write-Output ("计时测试 {0}：失败" -f $name); $fails++ }
     }
     if($fails -gt 0){exit 1}
     exit 0
@@ -350,6 +456,9 @@ function Show-Status {
     if($script:ProjectCombo.SelectedIndex -gt 0){$filter=[string]$script:ProjectCombo.SelectedItem}
     $selection=Pick-Run (Get-AllRuns) $filter ([int]$script:Config.stale_seconds)
     $r=$selection.Run
+    $script:DisplayedRun=$r
+    $script:DisplayedActiveCount=$selection.ActiveCount
+    $script:DisplayedStaleCount=$selection.StaleCount
     $script:HistoryText.Text=""
     if(-not $r){
         $script:StatusLabel.Text="状态：等待首次执行"
@@ -377,26 +486,8 @@ function Show-Status {
     $script:WorkflowLabel.Text="项目：" + (Split-Path -Leaf $r.Repository) + "    |    工作流：" + $r.Workflow
     $script:TaskLabel.Text="任务：" + $s.task + "    |    类型：" + $s.retry_kind
     $script:ModelLabel.Text="执行器：" + $s.adapter + "    |    模型：" + $s.model
-    $duration=[double]$s.elapsed_seconds
-    if($selection.Kind -eq "RUNNING" -or $selection.Kind -eq "STALE"){
-        try {
-            $since=([DateTimeOffset]::UtcNow - [DateTimeOffset]::Parse([string]$s.started_at)).TotalSeconds
-            if($since -gt $duration){$duration=$since}
-        } catch {}
-    }
-    $script:StatsLabel.Text="步骤：" + $s.steps + "     工具调用：" + $s.tool_calls + "     已运行：" + (Format-Duration $duration)
-    if($selection.Kind -eq "IDLE"){
-        $script:HealthLabel.Text="本次已结束；等待下一次 Executor 调用。"
-    } else {
-        $age=[int][math]::Min([int]::MaxValue,$r.HeartbeatAge)
-        $eventAge="尚无实际事件"
-        if(-not [double]::IsPositiveInfinity($r.EventAge)){$eventAge=([int]$r.EventAge).ToString() + " 秒前"}
-        $script:HealthLabel.Text="上次心跳：" + $age + " 秒前    |    最近实际事件：" + $eventAge
-    }
-    if($selection.ActiveCount -gt 1){$script:HealthLabel.Text += "    |    同时执行：" + $selection.ActiveCount}
-    if($selection.StaleCount -gt 0 -and $selection.Kind -eq "RUNNING"){
-        $script:HealthLabel.Text += "    |    其他异常：" + $selection.StaleCount
-    }
+    # 状态快照通过 30 秒磁盘刷新获取；时钟通过 1 秒 UI Timer 单独刷新。
+    Update-LiveClocks
     $lines=@(Get-RecentEvents $r)
     if($lines.Count -eq 0){$script:HistoryText.Text="暂无操作事件"}
     else {$script:HistoryText.Text=$lines -join [Environment]::NewLine}
@@ -428,6 +519,7 @@ function Hide-Window {
 function Exit-Monitor {
     $script:ExitRequested=$true
     $script:Timer.Stop()
+    $script:ClockTimer.Stop()
     $script:Tray.Visible=$false
     $script:Tray.Dispose()
     $script:Form.Close()
@@ -436,6 +528,12 @@ function Exit-Monitor {
 $script:Timer=New-Object System.Windows.Forms.Timer
 $script:Timer.Interval=[int]$script:Config.refresh_seconds * 1000
 $script:Timer.Add_Tick({ Safe-Refresh })
+# 不额外访问磁盘，每秒仅更新缓存快照对应的界面计时。
+$script:ClockTimer=New-Object System.Windows.Forms.Timer
+$script:ClockTimer.Interval=1000
+$script:ClockTimer.Add_Tick({
+    try { Update-LiveClocks } catch { $script:LastUiError=$_.Exception.Message }
+})
 $script:ProjectCombo.Add_SelectedIndexChanged({ $script:RemoveButton.Enabled=($script:ProjectCombo.SelectedIndex -gt 0); Safe-Refresh })
 $script:AddButton.Add_Click({
     $dialog=New-Object System.Windows.Forms.FolderBrowserDialog
@@ -488,11 +586,12 @@ $script:Form.Add_FormClosing({
         Hide-Window
     }
 })
-$script:Form.Add_Shown({ Sync-Projects; Safe-Refresh; $script:Timer.Start() })
+$script:Form.Add_Shown({ Sync-Projects; Safe-Refresh; $script:Timer.Start(); $script:ClockTimer.Start() })
 try {
     [System.Windows.Forms.Application]::Run($script:Form)
 } finally {
     $script:Timer.Dispose()
+    $script:ClockTimer.Dispose()
     $script:Tray.Visible=$false
     $script:Tray.Dispose()
     $script:Form.Dispose()
