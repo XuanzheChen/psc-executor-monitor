@@ -16,6 +16,8 @@ The first launch automatically:
 
 Click **添加项目 / Add project**, select your repository root (containing .agentic-sdlc), and the monitor can begin reading Executor progress files. You do not need to change CODEX_HOME.
 
+**Long project paths:** Hover over the closed project dropdown to smoothly scroll the selected full path to its end and back. The animation pauses when the list opens, and resets on mouse exit, project change, or window resizing. This only redraws UI text: project selection and disk refresh frequency remain unchanged.
+
 Later launches reuse the compiled executable. If a Git pull updates the C# launcher, icon or build script, it recompiles automatically. Changes to the PowerShell GUI are loaded on the next start; exit the current monitor through its tray menu to restart.
 
 If setup fails, the launcher displays an error dialog. Check monitor-setup-error.log, or run this in the cloned folder for detailed diagnostics:
