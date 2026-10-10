@@ -192,14 +192,39 @@ function Format-Event([object]$e) {
     return $message
 }
 
-function Get-ModelEffort([object]$state) {
-    # Progress writers differ by adapter/version. Never infer effort from the model name.
+function Get-ModelEffort([object]$state, [string]$repository = "") {
+    # Invocation-specific progress metadata is authoritative if provided.
     if (-not $state) { return "--" }
     foreach ($key in @("effort", "reasoning_effort", "model_reasoning_effort", "reasoningEffort")) {
         $property = $state.PSObject.Properties[$key]
         if ($property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
             return [string]$property.Value
         }
+    }
+    # Existing PSC progress snapshots do not record effort. Read the project's
+    # current runtime config, but only if adapter AND model match the displayed run.
+    # This is a configuration value, not historical proof of an invocation's effort.
+    if ([string]::IsNullOrWhiteSpace($repository)) { return "--" }
+    $path = Join-Path $repository ".agentic-sdlc\runtime.json"
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return "--" }
+    try {
+        $config = Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $executor = $config.executor
+        if (-not $executor -or [string]::IsNullOrWhiteSpace([string]$executor.adapter) -or
+            [string]$executor.adapter -ne [string]$state.adapter) { return "--" }
+        $route = $executor.routing
+        if ($route -and -not [string]::IsNullOrWhiteSpace([string]$route.model) -and
+            [string]$route.model -eq [string]$state.model -and
+            -not [string]::IsNullOrWhiteSpace([string]$route.effort)) {
+            return [string]$route.effort
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$executor.model) -and
+            [string]$executor.model -eq [string]$state.model -and
+            -not [string]::IsNullOrWhiteSpace([string]$executor.effort)) {
+            return [string]$executor.effort
+        }
+    } catch {
+        # A malformed or concurrently rewritten runtime.json must not break UI refresh.
     }
     return "--"
 }
@@ -653,7 +678,7 @@ function Show-Status {
         $script:WorkflowTooltip.SetToolTip($script:WorkflowLabel, "完整工作流名称：" + [Environment]::NewLine + [string]$r.Workflow)
     }
     $script:TaskLabel.Text="任务：" + $s.task + "    |    类型：" + $s.retry_kind
-    $script:ModelLabel.Text="执行器：" + $s.adapter + "    |    模型：" + $s.model + "    |    Effort：" + (Get-ModelEffort $s)
+    $script:ModelLabel.Text="执行器：" + $s.adapter + "    |    模型：" + $s.model + "    |    Effort：" + (Get-ModelEffort $s ([string]$r.Repository))
     Update-LiveClocks
     Update-EventLog $r
     $script:Tray.Text="PSC Monitor · " + $stateText
