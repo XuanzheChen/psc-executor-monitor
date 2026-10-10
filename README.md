@@ -31,7 +31,7 @@ Optional manual build:
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
     .\PSC-Monitor-Neon.exe
 
-Disk refresh defaults to 30 seconds and heartbeat staleness threshold to 90 seconds. Minimize to taskbar, close to tray, left click tray icon to restore, right click for menu.
+Executor progress snapshots and newly appended operation events are checked **every second** (read-only), with a 90-second heartbeat staleness threshold. The operation pane preserves all non-heartbeat JSONL events for the currently selected Executor invocation; newly appended bytes are read incrementally without reloading the full log. A changed or truncated log resets the pane. Hover over the workflow label to see its complete name in a white tooltip. The model row includes Effort from the progress snapshot when available, otherwise `--` (older PSC writers do not emit it). The monitor is a normal, non-topmost window. Minimize to taskbar, close to tray, left click tray icon to restore, right click for menu.
 
 ## 实机使用（中文）
 
@@ -43,7 +43,7 @@ Disk refresh defaults to 30 seconds and heartbeat staleness threshold to 90 seco
 
 ## Live elapsed-time display
 
-The GUI reads progress snapshots every **30 seconds** but updates the displayed elapsed time, heartbeat age and last-event age every **1 second**, without extra filesystem reads. Intervals use HH:mm:ss with correct hour flooring. On completion, elapsed time freezes and reconciles to the final elapsed_seconds value reported by PSC.
+The GUI checks progress snapshots every **1 second**, and incrementally follows the active Executor invocation's JSONL log every **1 second**. The displayed elapsed time, heartbeat age and last-event age also update every second. Intervals use HH:mm:ss with correct hour flooring. On completion, elapsed time freezes and reconciles to the final elapsed_seconds value reported by PSC.
 
 ## Registry support
 

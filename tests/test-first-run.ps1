@@ -26,7 +26,7 @@ try {
     Write-Output 'FRESH_EXE_SELFTEST=PASS'
 
     $json = Get-Content -LiteralPath $config -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($json.refresh_seconds -ne 30 -or @($json.repositories).Count -ne 0) { throw 'Unexpected initial config' }
+    if ($json.refresh_seconds -ne 1 -or @($json.repositories).Count -ne 0) { throw 'Unexpected initial config' }
     Write-Output 'INITIAL_CONFIG=PASS'
 
     $exeTime = (Get-Item $exe).LastWriteTimeUtc
