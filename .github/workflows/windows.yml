@@ -27,6 +27,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Project path marquee tests failed" }
           & powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\tests\test-project-colors.ps1
           if ($LASTEXITCODE -ne 0) { throw "Project path drawing color tests failed" }
+          & powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\tests\test-live-monitor.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Live full operation log tests failed" }
       - name: Test bootstrap from a fresh checkout
         shell: powershell
         run: |

@@ -7,6 +7,16 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
+# Preserve the user's position when new log lines arrive while they are scrolling history.
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class PscMonitorNative {
+    [DllImport("user32.dll")]
+    public static extern IntPtr SendMessage(IntPtr handle, int message, IntPtr wParam, IntPtr lParam);
+}
+"@
+
 $script:BaseDir = if ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { [AppDomain]::CurrentDomain.BaseDirectory.TrimEnd("\") }
 $script:ConfigPath = Join-Path $script:BaseDir "monitor-config.json"
 $script:ExitRequested = $false
@@ -15,23 +25,21 @@ $script:LastUiError = ""
 
 function Read-Config {
     $defaults = [PSCustomObject]@{
-        refresh_seconds = 30
+        refresh_seconds = 1
         stale_seconds = 90
-        always_on_top = $true
         repositories = @()
     }
     if (-not (Test-Path -LiteralPath $script:ConfigPath)) { return $defaults }
     try {
         $cfg = Get-Content -LiteralPath $script:ConfigPath -Encoding UTF8 -Raw | ConvertFrom-Json
         $repos = @($cfg.repositories | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ } | Select-Object -Unique)
-        $seconds = 30
-        if ($cfg.refresh_seconds -ge 5 -and $cfg.refresh_seconds -le 3600) { $seconds = [int]$cfg.refresh_seconds }
+        # Legacy refresh_seconds values (such as 30) are superseded by the 1 s live feed.
+        $seconds = 1
         $stale = 90
         if ($cfg.stale_seconds -ge 30 -and $cfg.stale_seconds -le 3600) { $stale = [int]$cfg.stale_seconds }
         return [PSCustomObject]@{
             refresh_seconds = $seconds
             stale_seconds = $stale
-            always_on_top = ($cfg.always_on_top -ne $false)
             repositories = $repos
         }
     } catch {
@@ -184,21 +192,102 @@ function Format-Event([object]$e) {
     return $message
 }
 
-function Get-RecentEvents([object]$run) {
-    $file = Join-Path $run.File.DirectoryName ("executor-progress\" + [string]$run.State.run_id + ".jsonl")
-    if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { return @() }
-    try {
-        $entries = @(Get-Content -LiteralPath $file -Encoding UTF8 -Tail 100 -ErrorAction Stop | ForEach-Object {
-            try { $_ | ConvertFrom-Json } catch { $null }
-        } | Where-Object { $_ -and $_.kind -ne "heartbeat" } | Select-Object -Last 6)
-        $lines = @()
-        foreach ($e in $entries) {
-            $time = ""
-            try { $time = ([DateTimeOffset]::Parse([string]$e.at)).ToLocalTime().ToString("HH:mm:ss") } catch {}
-            $lines += ("[{0}] {1}" -f $time, (Format-Event $e))
+function Get-ModelEffort([object]$state) {
+    # Progress writers differ by adapter/version. Never infer effort from the model name.
+    if (-not $state) { return "--" }
+    foreach ($key in @("effort", "reasoning_effort", "model_reasoning_effort", "reasoningEffort")) {
+        $property = $state.PSObject.Properties[$key]
+        if ($property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            return [string]$property.Value
         }
-        return $lines
-    } catch { return @() }
+    }
+    return "--"
+}
+
+$script:EventLogPath = ""
+$script:EventLogPosition = [long]0
+$script:EventLogPending = [byte[]]@()
+$script:EventLogCreatedUtc = [datetime]::MinValue
+function Reset-EventLog([string]$path) {
+    $script:EventLogPath = $path
+    $script:EventLogPosition = [long]0
+    $script:EventLogPending = [byte[]]@()
+    $script:EventLogCreatedUtc = [datetime]::MinValue
+    $script:HistoryText.Clear()
+}
+function Update-EventLog([object]$run) {
+    # Show all non-heartbeat operations for the selected invocation, not just a tail.
+    # Read only appended bytes; incomplete UTF-8/JSONL lines are held until a newline.
+    if (-not $run -or -not $run.State.run_id) {
+        if ($script:EventLogPath) { Reset-EventLog "" }
+        if (-not $script:HistoryText.TextLength) { $script:HistoryText.Text = "暂无操作事件" }
+        return
+    }
+    $path = Join-Path $run.File.DirectoryName ("executor-progress\" + [string]$run.State.run_id + ".jsonl")
+    if ($path -ne $script:EventLogPath) { Reset-EventLog $path }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        if (-not $script:HistoryText.TextLength) { $script:HistoryText.Text = "暂无操作事件" }
+        return
+    }
+    $stream = New-Object System.IO.FileStream($path,
+        [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+        $created = [System.IO.File]::GetCreationTimeUtc($path)
+        if ($stream.Length -lt $script:EventLogPosition -or
+            ($script:EventLogCreatedUtc -ne [datetime]::MinValue -and $created -ne $script:EventLogCreatedUtc)) {
+            Reset-EventLog $path
+        }
+        $script:EventLogCreatedUtc = $created
+        $remaining = $stream.Length - $script:EventLogPosition
+        if ($remaining -le 0) { return }
+        # Bound work per UI tick; future ticks continue where this one stopped.
+        $count = [int][math]::Min([long]1048576, $remaining)
+        $buffer = New-Object byte[] $count
+        [void]$stream.Seek($script:EventLogPosition, [System.IO.SeekOrigin]::Begin)
+        $read = $stream.Read($buffer, 0, $count)
+        if ($read -le 0) { return }
+        $script:EventLogPosition += $read
+    } finally {
+        $stream.Dispose()
+    }
+    $joined = New-Object byte[] ($script:EventLogPending.Length + $read)
+    [array]::Copy($script:EventLogPending, 0, $joined, 0, $script:EventLogPending.Length)
+    [array]::Copy($buffer, 0, $joined, $script:EventLogPending.Length, $read)
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $start = 0
+    for ($i = 0; $i -lt $joined.Length; $i++) {
+        if ($joined[$i] -ne 10) { continue }
+        $json = [System.Text.Encoding]::UTF8.GetString($joined, $start, $i - $start).TrimEnd([char]13).TrimStart([char]0xFEFF)
+        $start = $i + 1
+        if (-not $json) { continue }
+        try { $entry = $json | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        if ($entry.kind -eq "heartbeat") { continue }
+        $at = ""
+        try { $at = ([DateTimeOffset]::Parse([string]$entry.at)).ToLocalTime().ToString("HH:mm:ss") } catch {}
+        $lines.Add(("[{0}] {1}" -f $at, (Format-Event $entry)))
+    }
+    $leftover = $joined.Length - $start
+    $script:EventLogPending = New-Object byte[] $leftover
+    if ($leftover -gt 0) { [array]::Copy($joined, $start, $script:EventLogPending, 0, $leftover) }
+    if ($lines.Count -eq 0) { return }
+    if ($script:HistoryText.Text -eq "暂无操作事件") { $script:HistoryText.Clear() }
+    $previousCaret = $script:HistoryText.SelectionStart
+    $visibleLine = [PscMonitorNative]::SendMessage($script:HistoryText.Handle, [int]206,
+        [intptr]::Zero, [intptr]::Zero).ToInt32()
+    $visibleRows = [math]::Max(1,[math]::Floor($script:HistoryText.ClientSize.Height /
+        [math]::Max(1,$script:HistoryText.Font.Height)))
+    $wasAtEnd = ($visibleLine + $visibleRows -ge $script:HistoryText.Lines.Length - 1)
+    $script:HistoryText.AppendText(($lines -join [Environment]::NewLine) + [Environment]::NewLine)
+    if ($wasAtEnd) {
+        $script:HistoryText.SelectionStart = $script:HistoryText.TextLength
+        $script:HistoryText.ScrollToCaret()
+    } else {
+        $script:HistoryText.SelectionStart = $previousCaret
+        $nowVisible = [PscMonitorNative]::SendMessage($script:HistoryText.Handle,[int]206,
+            [intptr]::Zero,[intptr]::Zero).ToInt32()
+        [void][PscMonitorNative]::SendMessage($script:HistoryText.Handle,[int]182,
+            [intptr]::Zero,[intptr]($visibleLine - $nowVisible))
+    }
 }
 
 function Format-Duration([double]$seconds) {
@@ -358,7 +447,8 @@ $script:Form.Size = New-Object System.Drawing.Size(660,550)
 $script:Form.MinimumSize = New-Object System.Drawing.Size(640,510)
 $script:Form.Font = New-Object System.Drawing.Font($fontName,9)
 $script:Form.BackColor = [System.Drawing.Color]::FromArgb(246,248,251)
-$script:Form.TopMost = [bool]$script:Config.always_on_top
+# The monitor behaves as a normal window; legacy always_on_top configs are ignored.
+$script:Form.TopMost = $false
 
 function Make-Label([string]$text,[int]$x,[int]$y,[int]$w,[int]$h,[int]$size,[bool]$bold) {
     $c = New-Object System.Windows.Forms.Label
@@ -389,8 +479,35 @@ $script:TaskLabel = Make-Label "任务：--" 20 185 603 23 10 $false
 $script:ModelLabel = Make-Label "执行器：--" 20 215 603 22 9 $false
 $script:StatsLabel = Make-Label "步骤：--  |  工具调用：--  |  耗时：--" 20 246 603 27 11 $true
 $script:HealthLabel = Make-Label "心跳：--" 20 280 603 24 9 $false
-$historyLabel = Make-Label "最近操作" 20 314 240 26 11 $true
-$script:FooterLabel = Make-Label "每 30 秒刷新 · 仅本地只读" 20 475 606 24 9 $false
+$historyLabel = Make-Label "全部操作（当前 Executor 调用，心跳除外）" 20 314 480 26 11 $true
+$script:FooterLabel = Make-Label "每秒更新 · 仅本地只读" 20 475 606 24 9 $false
+$script:WorkflowTooltip = New-Object System.Windows.Forms.ToolTip
+$script:WorkflowTooltip.IsBalloon = $false
+$script:WorkflowTooltip.BackColor = [System.Drawing.Color]::White
+$script:WorkflowTooltip.ForeColor = [System.Drawing.Color]::FromArgb(35,45,58)
+$script:WorkflowTooltip.InitialDelay = 250
+$script:WorkflowTooltip.ReshowDelay = 100
+$script:WorkflowTooltip.AutoPopDelay = 30000
+$script:WorkflowTooltip.ShowAlways = $true
+$script:WorkflowTooltip.OwnerDraw = $true
+$script:WorkflowTooltip.Add_Popup({
+    param($sender,$e)
+    $text = $script:WorkflowTooltip.GetToolTip($script:WorkflowLabel)
+    $area = New-Object System.Drawing.Size(640, 0)
+    $size = [System.Windows.Forms.TextRenderer]::MeasureText($text, $script:WorkflowLabel.Font, $area,
+        [System.Windows.Forms.TextFormatFlags]::WordBreak)
+    $e.ToolTipSize = New-Object System.Drawing.Size(([math]::Min(660,$size.Width+24)),($size.Height+16))
+})
+$script:WorkflowTooltip.Add_Draw({
+    param($sender,$e)
+    $e.Graphics.FillRectangle([System.Drawing.Brushes]::White,$e.Bounds)
+    $frame = New-Object System.Drawing.Rectangle($e.Bounds.X,$e.Bounds.Y,($e.Bounds.Width-1),($e.Bounds.Height-1))
+    $e.Graphics.DrawRectangle([System.Drawing.Pens]::LightGray,$frame)
+    $inner = New-Object System.Drawing.Rectangle(($e.Bounds.Left+10),($e.Bounds.Top+8),
+        ([math]::Max(1,$e.Bounds.Width-20)),([math]::Max(1,$e.Bounds.Height-16)))
+    [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics,$e.ToolTipText,$script:WorkflowLabel.Font,
+        $inner,[System.Drawing.Color]::FromArgb(35,45,58),[System.Windows.Forms.TextFormatFlags]::WordBreak)
+})
 $script:FooterLabel.ForeColor = [System.Drawing.Color]::Gray
 
 $script:ProjectCombo = New-Object System.Windows.Forms.ComboBox
@@ -465,6 +582,7 @@ $script:HistoryText.Location=New-Object System.Drawing.Point(20,344)
 $script:HistoryText.Size=New-Object System.Drawing.Size(600,121)
 $script:HistoryText.Multiline=$true
 $script:HistoryText.ReadOnly=$true
+$script:HistoryText.MaxLength=[int]::MaxValue
 $script:HistoryText.ScrollBars="Vertical"
 $script:HistoryText.Font=New-Object System.Drawing.Font("Consolas",9)
 $script:HistoryText.BackColor=[System.Drawing.Color]::White
@@ -473,26 +591,14 @@ $script:Form.Controls.Add($script:HistoryText)
 $script:FooterLabel.Anchor="Bottom,Left"
 $script:FooterLabel.Location=New-Object System.Drawing.Point(20,478)
 
-$script:TopCheck=New-Object System.Windows.Forms.CheckBox
-$script:TopCheck.Text="始终置顶"
-$script:TopCheck.Location=New-Object System.Drawing.Point(508,19)
-$script:TopCheck.Size=New-Object System.Drawing.Size(112,27)
-$script:TopCheck.Anchor="Top,Right"
-$script:TopCheck.Checked=[bool]$script:Config.always_on_top
-$script:Form.Controls.Add($script:TopCheck)
-
-$script:Tray=New-Object System.Windows.Forms.NotifyIcon
+ $script:Tray=New-Object System.Windows.Forms.NotifyIcon
 $script:Tray.Icon=$script:AppIcon
 $script:Tray.Text="PSC Executor 实时监视器"
 $script:Tray.Visible=$true
 $script:TrayMenu=New-Object System.Windows.Forms.ContextMenuStrip
 $script:ShowMenu=$script:TrayMenu.Items.Add("显示监视窗口")
 $script:RefreshMenu=$script:TrayMenu.Items.Add("立即刷新")
-$script:TopMenu=New-Object System.Windows.Forms.ToolStripMenuItem("始终置顶")
-$script:TopMenu.CheckOnClick=$true
-$script:TopMenu.Checked=$script:TopCheck.Checked
-[void]$script:TrayMenu.Items.Add($script:TopMenu)
-[void]$script:TrayMenu.Items.Add("-")
+ [void]$script:TrayMenu.Items.Add("-")
 $script:ExitMenu=$script:TrayMenu.Items.Add("退出监视器")
 $script:Tray.ContextMenuStrip=$script:TrayMenu
 
@@ -515,8 +621,9 @@ function Show-Status {
     $script:DisplayedRun=$r
     $script:DisplayedActiveCount=$selection.ActiveCount
     $script:DisplayedStaleCount=$selection.StaleCount
-    $script:HistoryText.Text=""
     if(-not $r){
+        Update-EventLog $null
+        $script:WorkflowTooltip.SetToolTip($script:WorkflowLabel, "")
         $script:StatusLabel.Text="状态：等待首次执行"
         $script:StatusLabel.ForeColor=[System.Drawing.Color]::DarkGoldenrod
         $script:WorkflowLabel.Text="尚无 Executor 进度记录"
@@ -539,21 +646,23 @@ function Show-Status {
     }
     $script:StatusLabel.Text="状态：" + $stateText
     $script:StatusLabel.ForeColor=$color
-    $script:WorkflowLabel.Text="项目：" + (Split-Path -Leaf $r.Repository) + "    |    工作流：" + $r.Workflow
+    $workflowText = "项目：" + (Split-Path -Leaf $r.Repository) + "    |    工作流：" + $r.Workflow
+    if($script:WorkflowLabel.Text -ne $workflowText){
+        $script:WorkflowLabel.Text = $workflowText
+        # The tooltip shows the complete identifier even when the label is ellipsized.
+        $script:WorkflowTooltip.SetToolTip($script:WorkflowLabel, "完整工作流名称：" + [Environment]::NewLine + [string]$r.Workflow)
+    }
     $script:TaskLabel.Text="任务：" + $s.task + "    |    类型：" + $s.retry_kind
-    $script:ModelLabel.Text="执行器：" + $s.adapter + "    |    模型：" + $s.model
-    # 状态快照通过 30 秒磁盘刷新获取；时钟通过 1 秒 UI Timer 单独刷新。
+    $script:ModelLabel.Text="执行器：" + $s.adapter + "    |    模型：" + $s.model + "    |    Effort：" + (Get-ModelEffort $s)
     Update-LiveClocks
-    $lines=@(Get-RecentEvents $r)
-    if($lines.Count -eq 0){$script:HistoryText.Text="暂无操作事件"}
-    else {$script:HistoryText.Text=$lines -join [Environment]::NewLine}
+    Update-EventLog $r
     $script:Tray.Text="PSC Monitor · " + $stateText
 }
 function Safe-Refresh {
     try {
         Show-Status
         $script:LastUiError=""
-        $script:FooterLabel.Text="每 " + $script:Config.refresh_seconds + " 秒刷新  ·  最后检查：" + (Get-Date -Format "HH:mm:ss") + "  ·  仅本地只读"
+        $script:FooterLabel.Text="每秒更新  ·  最后检查：" + (Get-Date -Format "HH:mm:ss") + "  ·  仅本地只读"
     } catch {
         $script:LastUiError=$_.Exception.Message
         $script:StatusLabel.Text="读取异常（稍后自动重试）"
@@ -575,22 +684,16 @@ function Hide-Window {
 function Exit-Monitor {
     $script:ExitRequested=$true
     $script:Timer.Stop()
-    $script:ClockTimer.Stop()
-    $script:ProjectScrollTimer.Stop()
+     $script:ProjectScrollTimer.Stop()
     $script:Tray.Visible=$false
     $script:Tray.Dispose()
     $script:Form.Close()
 }
 
 $script:Timer=New-Object System.Windows.Forms.Timer
-$script:Timer.Interval=[int]$script:Config.refresh_seconds * 1000
+# Poll progress/registry once per second; log events are read incrementally.
+$script:Timer.Interval=1000
 $script:Timer.Add_Tick({ Safe-Refresh })
-# 不额外访问磁盘，每秒仅更新缓存快照对应的界面计时。
-$script:ClockTimer=New-Object System.Windows.Forms.Timer
-$script:ClockTimer.Interval=1000
-$script:ClockTimer.Add_Tick({
-    try { Update-LiveClocks } catch { $script:LastUiError=$_.Exception.Message }
-})
 # 悬停时仅做 WinForms 重绘，不读取 PSC 数据；离开、展开和切换项目均复位。
 $script:ProjectScrollTimer=New-Object System.Windows.Forms.Timer
 $script:ProjectScrollTimer.Interval=40
@@ -659,16 +762,7 @@ $script:RemoveButton.Add_Click({
     Sync-Projects
     Safe-Refresh
 })
-$script:TopCheck.Add_CheckedChanged({
-    $script:Form.TopMost=$script:TopCheck.Checked
-    $script:TopMenu.Checked=$script:TopCheck.Checked
-    $script:Config.always_on_top=$script:TopCheck.Checked
-    Save-Config
-})
-$script:TopMenu.Add_Click({
-    $script:TopCheck.Checked=$script:TopMenu.Checked
-})
-$script:ShowMenu.Add_Click({ Restore-Window })
+ $script:ShowMenu.Add_Click({ Restore-Window })
 $script:RefreshMenu.Add_Click({ Safe-Refresh })
 $script:ExitMenu.Add_Click({ Exit-Monitor })
 $script:Tray.Add_MouseClick({
@@ -684,15 +778,15 @@ $script:Form.Add_FormClosing({
         Hide-Window
     }
 })
-$script:Form.Add_Shown({ Sync-Projects; Safe-Refresh; $script:Timer.Start(); $script:ClockTimer.Start() })
+$script:Form.Add_Shown({ Sync-Projects; Safe-Refresh; $script:Timer.Start() })
 try {
     [System.Windows.Forms.Application]::Run($script:Form)
 } finally {
     $script:Timer.Dispose()
-    $script:ClockTimer.Dispose()
-    $script:ProjectScrollTimer.Dispose()
+     $script:ProjectScrollTimer.Dispose()
     $script:Tray.Visible=$false
     $script:Tray.Dispose()
+    $script:WorkflowTooltip.Dispose()
     $script:Form.Dispose()
     $script:AppIcon.Dispose()
     if($mutexCreated){$script:Mutex.ReleaseMutex()}
