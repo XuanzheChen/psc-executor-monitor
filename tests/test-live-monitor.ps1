@@ -29,6 +29,37 @@ Assert-True ((Get-ModelEffort ([pscustomobject]@{ model='example'; reasoning_eff
 Assert-True ((Get-ModelEffort ([pscustomobject]@{ effort='xhigh' })) -eq 'xhigh') 'effort xhigh not shown'
 Assert-True ((Get-ModelEffort ([pscustomobject]@{ model='example' })) -eq '--') 'missing effort must not be guessed'
 
+# Runtime configurations may be nested (DSH routing) or flat (Codex).
+$configRepo = Join-Path ([System.IO.Path]::GetTempPath()) ('PSC-monitor-effort-' + [guid]::NewGuid().ToString('N'))
+$configDir = Join-Path $configRepo '.agentic-sdlc'
+New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+$configFile = Join-Path $configDir 'runtime.json'
+$runtimeEncoding = New-Object System.Text.UTF8Encoding($false)
+function Write-TestRuntime([object]$data) {
+    [System.IO.File]::WriteAllText($configFile, ($data | ConvertTo-Json -Depth 8), $runtimeEncoding)
+}
+try {
+    $dshState = [pscustomobject]@{ status='running'; adapter='dsh'; model='deepseek-v4.1-flash' }
+    Write-TestRuntime @{ executor=@{ adapter='dsh'; routing=@{ provider='opencode-go'; model='deepseek-v4.1-flash'; effort='high' } } }
+    Assert-True ((Get-ModelEffort $dshState $configRepo) -eq 'high') 'DSH routing effort should resolve'
+    $dshOverride = [pscustomobject]@{ status='running'; adapter='dsh'; model='deepseek-v4.1-flash'; effort='max' }
+    Assert-True ((Get-ModelEffort $dshOverride $configRepo) -eq 'max') 'invocation effort must override runtime config'
+    Assert-True ((Get-ModelEffort ([pscustomobject]@{adapter='dsh';model='other-model'}) $configRepo) -eq '--') 'model mismatch must not reuse effort'
+    Assert-True ((Get-ModelEffort ([pscustomobject]@{adapter='codex';model='deepseek-v4.1-flash'}) $configRepo) -eq '--') 'adapter mismatch must not reuse effort'
+
+    Write-TestRuntime @{ executor=@{ adapter='codex'; model='gpt-6-astra'; effort='xhigh' } }
+    $codexState = [pscustomobject]@{ status='running'; adapter='codex'; model='gpt-6-astra' }
+    Assert-True ((Get-ModelEffort $codexState $configRepo) -eq 'xhigh') 'flat Codex effort should resolve'
+    Assert-True ((Get-ModelEffort $dshState $configRepo) -eq '--') 'switching runtime config must not leave stale effort'
+    [System.IO.File]::WriteAllText($configFile, '{bad json', $runtimeEncoding)
+    Assert-True ((Get-ModelEffort $codexState $configRepo) -eq '--') 'malformed runtime must degrade to unknown'
+    Remove-Item -LiteralPath $configFile -Force
+    Assert-True ((Get-ModelEffort $codexState $configRepo) -eq '--') 'missing runtime must degrade to unknown'
+    Write-Output 'RUNTIME_EFFORT_TEST=PASS'
+} finally {
+    Remove-Item -LiteralPath $configRepo -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 $base = Join-Path ([System.IO.Path]::GetTempPath()) ('PSC-monitor-live-' + [guid]::NewGuid().ToString('N'))
 $folder = Join-Path $base 'executor-progress'
 New-Item -ItemType Directory -Path $folder -Force | Out-Null
